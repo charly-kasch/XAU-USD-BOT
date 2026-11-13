@@ -16,9 +16,9 @@ CAPITAL      = 2500
 RISK_PERCENT = 0.05
 RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $10
 
-MAX_TRADES_PER_DAY = 6
-MIN_CONFIDENCE     = 65
-MIN_SL_DOLLARS     = 3.0
+MAX_TRADES_PER_DAY = 3
+MIN_CONFIDENCE     = 80
+MIN_SL_DOLLARS     = 5.0
 MAX_SL_DOLLARS     = 20.0
 MIN_FVG_SIZE       = 1.50   # minimum FVG gap in dollars to count
 EQUAL_LEVEL_TOL    = 0.30   # dollars — how close two highs/lows must be to count as "equal"
