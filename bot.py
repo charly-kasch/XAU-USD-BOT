@@ -17,7 +17,7 @@ RISK_PERCENT = 0.05
 RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $125 max. Risiko pro Trade
 
 MAX_TRADES_PER_DAY = 3
-MIN_CONFIDENCE     = 82      # Strenger Filter: nur Top-Setups
+MIN_CONFIDENCE     = 80      # Strenger Filter: nur Top-Setups
 MIN_SL_DOLLARS     = 10.0    # Schutz vor normalem Gold-Rauschen
 MAX_SL_DOLLARS     = 30.0
 MIN_FVG_SIZE       = 1.50
