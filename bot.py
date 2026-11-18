@@ -23,7 +23,7 @@ MIN_SL_DOLLARS     = 10.0    # Schutz vor normalem Gold-Rauschen
 MAX_SL_DOLLARS     = 30.0
 MIN_FVG_SIZE       = 1.50
 EQUAL_LEVEL_TOL    = 0.30
-ONLY_KILLZONES     = True    # True = Nur London & NY Session (ohne 14:30 News-Spike)
+ONLY_KILLZONES     = True    # True = 08:00-21:00 MEZ (ohne 14:30 News-Spike & Nacht-Rauschen)
 TZ                 = pytz.timezone('Europe/Berlin')
 
 PAPER_MODE = True
@@ -386,7 +386,6 @@ def monitor_active_trade(closed_5m):
     sl_r    = active_trade["sl_r"]
 
     if d == "LONG":
-        # 1. Prüfen, ob der aktuelle (oder nachgezogene) SL getroffen wurde
         if last_c["low"] <= sl:
             locked_r   = round((sl - entry) / sl_dist, 1)
             locked_usd = round(locked_r * RISK_AMOUNT, 2)
@@ -400,7 +399,6 @@ def monitor_active_trade(closed_5m):
             active_trade = None
             return
 
-        # 2. Neuen Höchststand in R berechnen
         reached_r = (last_c["high"] - entry) / sl_dist
 
     elif d == "SHORT":
@@ -421,12 +419,10 @@ def monitor_active_trade(closed_5m):
     else:
         return
 
-    # Meilenstein auf 0.5R genau runden (1.0, 1.5, 2.0, 2.5, 3.0, 3.5...)
     milestone_r = math.floor(reached_r * 2) / 2.0
     if milestone_r < 1.0:
         return
 
-    # Ab 1:3 (3.0R) enger auf 0.5R Abstand trailen, davor 1.0R Luft lassen
     new_sl_r = round(milestone_r - 0.5, 1) if milestone_r >= 3.0 else round(milestone_r - 1.0, 1)
 
     if new_sl_r > sl_r:
@@ -561,7 +557,7 @@ def generate_signal(candles_5m, candles_15m, candles_1h):
 
     sl_dollars = calculate_sl_distance(closed_5m, signal, ob_high, ob_low, atr)
     sl_dollars = min(max(sl_dollars, MIN_SL_DOLLARS), MAX_SL_DOLLARS)
-    tp3_dollars = sl_dollars * 3.0  # 1:3 Richtziel
+    tp3_dollars = sl_dollars * 3.0
 
     lots, actual_risk, is_safe = calculate_lots(sl_dollars)
     if not is_safe:
@@ -634,24 +630,23 @@ def send_signal(sig):
     print(f"✅ Signal: {sig['signal']} @ {sig['price']} | 1:3 Ziel @ {tp3_price:.2f}")
 
 # ============================================
-# SESSION & KILLZONE CHECK
+# SESSION & KILLZONE CHECK (08:00 - 21:00 MEZ)
 # ============================================
 def check_session_allowed(now):
     """
-    Erlaubt Trades nur in liquiden Marktphasen (London & New York)
-    und pausiert rund um 14:30 Uhr (US-Wirtschaftsdaten / Spread-Spikes).
+    Deckt den kompletten europäischen & US-Handelstag ab (08:00 - 21:00 MEZ)
+    und pausiert nur rund um 14:30 Uhr (US-Wirtschaftsdaten) sowie in der
+    volumenarmen Nachtsession (21:00 - 08:00 Uhr), um API-Credits zu sparen.
     """
-    minutes = now.hour * 60 + now.minute
-    # London Killzone: 08:30 - 12:00 MEZ
-    in_london = (8 * 60 + 30) <= minutes <= (12 * 60)
-    # New York Killzone: 14:45 - 20:00 MEZ (umgeht den 14:30 News-Spike!)
-    in_ny     = (14 * 60 + 45) <= minutes <= (20 * 60)
+    minutes    = now.hour * 60 + now.minute
+    in_eu      = (8 * 60) <= minutes <= (14 * 60 + 20)
+    in_us      = (14 * 60 + 40) <= minutes <= (21 * 60)
 
-    if in_london:
-        return True, "London Killzone 🇬🇧"
-    if in_ny:
-        return True, "New York Killzone 🗽"
-    return False, "Off-Killzone / News-Schutz ⏸️"
+    if in_eu:
+        return True, "EU/London Session 🇪🇺🇬🇧"
+    if in_us:
+        return True, "US/New York Session 🗽"
+    return False, "Nachtruhe / News-Schutz ⏸️"
 
 # ============================================
 # MAIN LOOP
@@ -666,9 +661,9 @@ def main():
         f"Strategy: BOS + CHoCH + Order Blocks\n"
         f"+ Liquidity Sweeps + FVG + ADX + Confirmation\n\n"
         f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f}\n"
+        f"Session: 08:00 - 21:00 MEZ (Credit-Saver aktiv)\n"
         f"Target: 1:3+ Runner (Unlimited Trailing SL)\n"
-        f"Min Confidence: {MIN_CONFIDENCE}%\n"
-        f"Max Signals/Day: {MAX_TRADES_PER_DAY}\n\n"
+        f"Min Confidence: {MIN_CONFIDENCE}% | Max/Day: {MAX_TRADES_PER_DAY}\n\n"
         f"Scanning every 5 minutes ⚔️"
     )
 
@@ -687,6 +682,17 @@ def main():
                 time.sleep(3600)
                 continue
 
+            allowed, session_label = check_session_allowed(now)
+            print(f"\n[{now.strftime('%H:%M')}] {session_label} | Signals: {trades_today}/{MAX_TRADES_PER_DAY}")
+
+            # Außerhalb 08:00-21:00 Uhr keine API-Credits verbrauchen (außer ein Trade läuft noch)
+            if not active_trade and ONLY_KILLZONES and not allowed:
+                print("Nachtruhe / News-Schutz — pausiere API-Abfragen (spart Credits).")
+                ts         = time.time()
+                sleep_time = (300 - (ts % 300)) + 3
+                time.sleep(sleep_time)
+                continue
+
             candles_5m  = get_candles("5min", 100)
             time.sleep(2)
             candles_15m = get_candles("15min", 100)
@@ -702,15 +708,10 @@ def main():
             if active_trade:
                 monitor_active_trade(candles_5m[:-1])
 
-            allowed, session_label = check_session_allowed(now)
-            print(f"\n[{now.strftime('%H:%M')}] {session_label} | Signals: {trades_today}/{MAX_TRADES_PER_DAY}")
-
             if active_trade:
                 print("Aktiver Trade läuft noch — warte auf Abschluss vor neuem Signal.")
             elif trades_today >= MAX_TRADES_PER_DAY:
                 print("Tageslimit erreicht.")
-            elif ONLY_KILLZONES and not allowed:
-                print("Außerhalb der Killzones — kein Trade (Schutz vor Fehlausbrüchen).")
             else:
                 sig = generate_signal(candles_5m, candles_15m, candles_1h)
                 if sig:
