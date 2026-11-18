@@ -14,10 +14,10 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 SYMBOL       = "XAU/USD"
 CAPITAL      = 2500
 RISK_PERCENT = 0.02
-RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $125 max. Risiko pro Trade
+RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $50.00 max. Risiko pro Trade (2%)
 
 MAX_TRADES_PER_DAY = 3
-MIN_CONFIDENCE     = 80      # Strenger Filter: nur Top-Setups
+MIN_CONFIDENCE     = 75      # Angepasst: lässt solide SMC-Setups durch
 MIN_SL_DOLLARS     = 10.0    # Schutz vor normalem Gold-Rauschen
 MAX_SL_DOLLARS     = 30.0
 MIN_FVG_SIZE       = 1.50
@@ -115,7 +115,7 @@ def calculate_atr(candles, period=14):
     return sum(tr_list[-period:]) / period
 
 def calculate_adx(candles, period=14):
-    """Misst die Trendstärke. Unter 20 = Seitwärtsmarkt (Gefahr für SL)."""
+    """Misst die Trendstärke. Unter 18 = Seitwärtsmarkt (Gefahr für SL)."""
     if len(candles) < period * 2:
         return 25.0
     plus_dm, minus_dm, tr_list = [], [], []
@@ -431,8 +431,8 @@ def generate_signal(candles_5m, candles_15m, candles_1h):
 
     # 1. ADX Trendstärke-Check (verhindert SL in flachen Seitwärtsmärkten)
     adx_15m = calculate_adx(closed_15m)
-    if adx_15m < 20:
-        print(f"Price: {curr_price:.2f} | ADX 15M = {adx_15m} (<20) — Markt zu flach, kein Trade.")
+    if adx_15m < 18:
+        print(f"Price: {curr_price:.2f} | ADX 15M = {adx_15m} (<18) — Markt zu flach, kein Trade.")
         return None
 
     # 2. 1H Macro Trend Gate
