@@ -1,4 +1,5 @@
 import os
+import math
 import requests
 import time
 from datetime import datetime
@@ -17,7 +18,7 @@ RISK_PERCENT = 0.02
 RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $50.00 max. Risiko pro Trade (2%)
 
 MAX_TRADES_PER_DAY = 3
-MIN_CONFIDENCE     = 75      # Angepasst: lässt solide SMC-Setups durch
+MIN_CONFIDENCE     = 75      # Lässt solide SMC-Setups durch
 MIN_SL_DOLLARS     = 10.0    # Schutz vor normalem Gold-Rauschen
 MAX_SL_DOLLARS     = 30.0
 MIN_FVG_SIZE       = 1.50
@@ -37,7 +38,7 @@ trades_today          = 0
 last_trade_date       = None
 last_signal_direction = None
 last_signal_time      = 0
-active_trade          = None  # Überwacht den aktuell laufenden Trade für Break-Even/TP/SL
+active_trade          = None  # Überwacht den laufenden Trade für dynamisches SL-Trailing
 
 # ============================================
 # TELEGRAM
@@ -365,57 +366,91 @@ def calculate_lots(sl_dollars):
     return lots, round(actual_risk, 2), is_safe
 
 # ============================================
-# ACTIVE TRADE MONITOR (BREAK-EVEN & SL/TP)
+# ACTIVE TRADE MONITOR (1:3+ UNLIMITED PROFIT TRAIL)
 # ============================================
 def monitor_active_trade(closed_5m):
+    """
+    Zieht den SL stufenweise nach, ohne den Gewinn bei 1:3 zu deckeln:
+    - Bis 2.5R: 1.0R Abstand (1.0R -> BE, 1.5R -> +0.5R, 2.0R -> +1.0R, 2.5R -> +1.5R)
+    - Ab 3.0R (1:3 erreicht): 0.5R Abstand (3.0R -> +2.5R, 3.5R -> +3.0R, 4.0R -> +3.5R...)
+    """
     global active_trade
     if not active_trade or not closed_5m:
         return
 
-    last_c = closed_5m[-1]
-    d      = active_trade["signal"]
-    entry  = active_trade["entry"]
-    sl     = active_trade["sl"]
-    tp     = active_trade["tp"]
-    be_trg = active_trade["be_trigger"]
+    last_c  = closed_5m[-1]
+    d       = active_trade["signal"]
+    entry   = active_trade["entry"]
+    sl      = active_trade["sl"]
+    sl_dist = active_trade["sl_dist"]
+    sl_r    = active_trade["sl_r"]
 
     if d == "LONG":
+        # 1. Prüfen, ob der aktuelle (oder nachgezogene) SL getroffen wurde
         if last_c["low"] <= sl:
-            status = "🛡️ BREAK-EVEN HIT ($0)" if active_trade["be_moved"] else "🛑 STOP LOSS HIT"
-            send_telegram(f"{status}\nXAUUSD LONG @ {entry:.2f} geschlossen bei {sl:.2f}.")
+            locked_r   = round((sl - entry) / sl_dist, 1)
+            locked_usd = round(locked_r * RISK_AMOUNT, 2)
+            if locked_r > 0:
+                status = f"💰 <b>PROFIT GESICHERT (+{locked_r}R | ~+${locked_usd:.2f})!</b>"
+            elif locked_r == 0:
+                status = "🛡️ <b>BREAK-EVEN HIT ($0)</b>"
+            else:
+                status = f"🛑 <b>STOP LOSS HIT (-1R | ~-${RISK_AMOUNT:.2f})</b>"
+            send_telegram(f"{status}\nXAUUSD LONG @ {entry:.2f} geschlossen bei <b>{sl:.2f}</b>.")
             active_trade = None
             return
-        if last_c["high"] >= tp:
-            send_telegram(f"🎯 <b>TAKE PROFIT HIT (+2R)!</b>\nXAUUSD LONG @ {entry:.2f} -> Ziel {tp:.2f} erreicht!")
-            active_trade = None
-            return
-        if not active_trade["be_moved"] and last_c["high"] >= be_trg:
-            active_trade["sl"]       = entry
-            active_trade["be_moved"] = True
-            send_telegram(
-                f"🛡️ <b>BREAK-EVEN AKTIVIERT!</b>\n"
-                f"XAUUSD LONG hat 1:1 erreicht ({be_trg:.2f}).\n"
-                f"👉 Ziehe deinen SL jetzt auf <b>{entry:.2f}</b> (risikofrei)!"
-            )
+
+        # 2. Neuen Höchststand in R berechnen
+        reached_r = (last_c["high"] - entry) / sl_dist
 
     elif d == "SHORT":
         if last_c["high"] >= sl:
-            status = "🛡️ BREAK-EVEN HIT ($0)" if active_trade["be_moved"] else "🛑 STOP LOSS HIT"
-            send_telegram(f"{status}\nXAUUSD SHORT @ {entry:.2f} geschlossen bei {sl:.2f}.")
+            locked_r   = round((entry - sl) / sl_dist, 1)
+            locked_usd = round(locked_r * RISK_AMOUNT, 2)
+            if locked_r > 0:
+                status = f"💰 <b>PROFIT GESICHERT (+{locked_r}R | ~+${locked_usd:.2f})!</b>"
+            elif locked_r == 0:
+                status = "🛡️ <b>BREAK-EVEN HIT ($0)</b>"
+            else:
+                status = f"🛑 <b>STOP LOSS HIT (-1R | ~-${RISK_AMOUNT:.2f})</b>"
+            send_telegram(f"{status}\nXAUUSD SHORT @ {entry:.2f} geschlossen bei <b>{sl:.2f}</b>.")
             active_trade = None
             return
-        if last_c["low"] <= tp:
-            send_telegram(f"🎯 <b>TAKE PROFIT HIT (+2R)!</b>\nXAUUSD SHORT @ {entry:.2f} -> Ziel {tp:.2f} erreicht!")
-            active_trade = None
-            return
-        if not active_trade["be_moved"] and last_c["low"] <= be_trg:
-            active_trade["sl"]       = entry
-            active_trade["be_moved"] = True
-            send_telegram(
-                f"🛡️ <b>BREAK-EVEN AKTIVIERT!</b>\n"
-                f"XAUUSD SHORT hat 1:1 erreicht ({be_trg:.2f}).\n"
-                f"👉 Ziehe deinen SL jetzt auf <b>{entry:.2f}</b> (risikofrei)!"
-            )
+
+        reached_r = (entry - last_c["low"]) / sl_dist
+    else:
+        return
+
+    # Meilenstein auf 0.5R genau runden (1.0, 1.5, 2.0, 2.5, 3.0, 3.5...)
+    milestone_r = math.floor(reached_r * 2) / 2.0
+    if milestone_r < 1.0:
+        return
+
+    # Ab 1:3 (3.0R) enger auf 0.5R Abstand trailen, davor 1.0R Luft lassen
+    new_sl_r = round(milestone_r - 0.5, 1) if milestone_r >= 3.0 else round(milestone_r - 1.0, 1)
+
+    if new_sl_r > sl_r:
+        new_sl_price = round(entry + (new_sl_r * sl_dist), 2) if d == "LONG" else round(entry - (new_sl_r * sl_dist), 2)
+        active_trade["sl"]   = new_sl_price
+        active_trade["sl_r"] = new_sl_r
+        locked_usd           = round(new_sl_r * RISK_AMOUNT, 2)
+
+        if new_sl_r == 0.0:
+            header = "🛡️ <b>BREAK-EVEN AKTIVIERT (0R)!</b>"
+            info   = "Trade ist jetzt komplett risikofrei."
+        elif new_sl_r >= 2.5:
+            header = f"🚀 <b>1:3+ RUNNER-TRAIL (+{new_sl_r}R gesichert)!</b>"
+            info   = f"Sicherer Gewinn: <b>~+${locked_usd:.2f}</b> — Trade läuft ohne Deckel weiter!"
+        else:
+            header = f"💰 <b>PROFIT-LOCK AKTIVIERT (+{new_sl_r}R)!</b>"
+            info   = f"Sicherer Gewinn: <b>~+${locked_usd:.2f}</b>"
+
+        send_telegram(
+            f"{header}\n"
+            f"XAUUSD {d} hat <b>{milestone_r:.1f}R</b> erreicht.\n"
+            f"👉 Ziehe deinen SL in MT5 jetzt auf <b>{new_sl_price:.2f}</b>!\n"
+            f"{info}"
+        )
 
 # ============================================
 # MAIN SIGNAL ENGINE
@@ -526,7 +561,7 @@ def generate_signal(candles_5m, candles_15m, candles_1h):
 
     sl_dollars = calculate_sl_distance(closed_5m, signal, ob_high, ob_low, atr)
     sl_dollars = min(max(sl_dollars, MIN_SL_DOLLARS), MAX_SL_DOLLARS)
-    tp_dollars = sl_dollars * 2.0
+    tp3_dollars = sl_dollars * 3.0  # 1:3 Richtziel
 
     lots, actual_risk, is_safe = calculate_lots(sl_dollars)
     if not is_safe:
@@ -534,7 +569,7 @@ def generate_signal(candles_5m, candles_15m, candles_1h):
 
     return {
         "signal": signal, "price": curr_price,
-        "sl_dollars": round(sl_dollars, 2), "tp_dollars": round(tp_dollars, 2),
+        "sl_dollars": round(sl_dollars, 2), "tp3_dollars": round(tp3_dollars, 2),
         "lots": lots, "potential_loss": actual_risk, "confidence": score,
         "reasons": reasons, "rsi": rsi, "atr": round(atr, 2), "adx": adx_15m,
         "tf_bias": tf_bias, "bos_type": bos_type or "None", "choch": choch,
@@ -552,21 +587,20 @@ def send_signal(sig):
     emoji     = "📈" if sig["signal"] == "LONG" else "📉"
 
     if sig["signal"] == "LONG":
-        sl_price = sig["price"] - sig["sl_dollars"]
-        be_price = sig["price"] + sig["sl_dollars"]
-        tp_price = sig["price"] + sig["tp_dollars"]
+        sl_price  = sig["price"] - sig["sl_dollars"]
+        be_price  = sig["price"] + sig["sl_dollars"]
+        tp3_price = sig["price"] + sig["tp3_dollars"]
     else:
-        sl_price = sig["price"] + sig["sl_dollars"]
-        be_price = sig["price"] - sig["sl_dollars"]
-        tp_price = sig["price"] - sig["tp_dollars"]
+        sl_price  = sig["price"] + sig["sl_dollars"]
+        be_price  = sig["price"] - sig["sl_dollars"]
+        tp3_price = sig["price"] - sig["tp3_dollars"]
 
     active_trade = {
-        "signal":     sig["signal"],
-        "entry":      sig["price"],
-        "sl":         sl_price,
-        "be_trigger": be_price,
-        "tp":         tp_price,
-        "be_moved":   False
+        "signal":  sig["signal"],
+        "entry":   sig["price"],
+        "sl":      sl_price,
+        "sl_dist": sig["sl_dollars"],
+        "sl_r":    -1.0
     }
 
     reasons_text = "\n".join([f"  ✅ {r}" for r in sig["reasons"]])
@@ -581,10 +615,10 @@ def send_signal(sig):
 📊 <b>Direction:</b> {direction}
 💰 <b>Entry:</b> {sig["price"]:.2f} (Market)
 🛑 <b>Stop Loss:</b> {sl_price:.2f} (${sig["sl_dollars"]:.2f} away)
-🛡️ <b>Break-Even at:</b> {be_price:.2f} (1:1 R:R)
-🎯 <b>Take Profit:</b> {tp_price:.2f} (${sig["tp_dollars"]:.2f} away)
-📦 <b>Lots:</b> {sig["lots"]}
-⚖️ <b>R:R:</b> 1:2 | <b>Conf:</b> {sig["confidence"]}%
+🛡️ <b>1. Schritt (BE 1:1):</b> {be_price:.2f}
+🎯 <b>1:3 Ziel-Marke:</b> {tp3_price:.2f} (${sig["tp3_dollars"]:.2f} away)
+🔓 <b>Take Profit:</b> <b>OFFEN</b> (SL trailt ab 1:3 weiter!)
+📦 <b>Lots:</b> {sig["lots"]} | <b>Conf:</b> {sig["confidence"]}%
 💵 <b>Max Risk:</b> ~${sig["potential_loss"]:.2f}
 ━━━━━━━━━━━━━━━━━━━━
 📋 <b>WHY THIS TRADE:</b>
@@ -594,10 +628,10 @@ def send_signal(sig):
 🕯 <b>Trigger:</b> {sig["pattern"]} | <b>ATR:</b> ${sig["atr"]}
 ━━━━━━━━━━━━━━━━━━━━
 🕐 {now_str}
-⚠️ <i>SL bei {be_price:.2f} auf Break-Even ziehen!</i>"""
+⚠️ <i>In MT5 KEINEN festen TP setzen — Bot meldet jede SL-Stufe!</i>"""
 
     send_telegram(msg)
-    print(f"✅ Signal: {sig['signal']} @ {sig['price']} | BE @ {be_price:.2f}")
+    print(f"✅ Signal: {sig['signal']} @ {sig['price']} | 1:3 Ziel @ {tp3_price:.2f}")
 
 # ============================================
 # SESSION & KILLZONE CHECK
@@ -632,9 +666,9 @@ def main():
         f"Strategy: BOS + CHoCH + Order Blocks\n"
         f"+ Liquidity Sweeps + FVG + ADX + Confirmation\n\n"
         f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f}\n"
+        f"Target: 1:3+ Runner (Unlimited Trailing SL)\n"
         f"Min Confidence: {MIN_CONFIDENCE}%\n"
-        f"Max Signals/Day: {MAX_TRADES_PER_DAY}\n"
-        f"Timeframes: 5M + 15M + 1H + Break-Even Monitor\n\n"
+        f"Max Signals/Day: {MAX_TRADES_PER_DAY}\n\n"
         f"Scanning every 5 minutes ⚔️"
     )
 
@@ -664,7 +698,7 @@ def main():
                 time.sleep(120)
                 continue
 
-            # Laufenden Trade zuerst auf Break-Even / TP / SL prüfen
+            # Laufenden Trade zuerst auf dynamische SL-Stufen prüfen
             if active_trade:
                 monitor_active_trade(candles_5m[:-1])
 
