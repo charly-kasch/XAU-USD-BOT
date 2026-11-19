@@ -50,7 +50,7 @@ USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0
 # ============================================
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(text, flush=True)
+        print(f"⚠️ Telegram nicht konfiguriert (Token/Chat-ID fehlt). Nachricht: {text}", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -59,9 +59,11 @@ def send_telegram_message(text):
         "parse_mode": "HTML",
     }
     try:
-        requests.post(url, json=payload, timeout=15)
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"⚠️ Telegram API Fehler ({r.status_code}): {r.text}", flush=True)
     except requests.exceptions.RequestException as e:
-        print(f"Telegram-Fehler: {e}", flush=True)
+        print(f"⚠️ Telegram Netzwerk-Fehler: {e}", flush=True)
 
 
 def load_state():
@@ -620,6 +622,7 @@ def manage_active_trade(state, candle, close_dt):
 def run_bot():
     state = load_state()
     print(f"🤖 XAU/USD SMC Bot gestartet | Kapital: ${state['equity']:.2f}", flush=True)
+    send_telegram_message(f"🤖 <b>Bot online</b> ({SYMBOL}) | Kapital: <b>${state['equity']:.2f}</b>")
 
     while True:
         try:
