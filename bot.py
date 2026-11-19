@@ -1,12 +1,12 @@
 import os
 import math
-import requests
 import time
+import requests
 from datetime import datetime
 import pytz
 
 # ============================================
-# CONFIGURATION (10K+ SETTINGS)
+# CONFIGURATION (SMC v3 HIGH-COMPOUND TELEGRAM BOT)
 # ============================================
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
@@ -15,22 +15,22 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 SYMBOL       = "XAU/USD"
 CAPITAL      = 2500
 
-# Anti-Martingale Zinseszins-Modell (10k+ Settings)
+# Verfeinertes Anti-Martingale Zinseszins-Modell
 BASE_RISK_PERCENT  = 0.028   # 2.8% Standard-Risiko
 SAFE_RISK_PERCENT  = 0.0125  # 1.25% Schutz-Risiko nach 2 Verlusten in Folge
 BOOST_RISK_PERCENT = 0.038   # 3.8% Wachstums-Risiko am Konto-Allzeithoch
 MAX_LOTS           = 5.00
 
-# Strategie- & Filterparameter (10k+ Settings)
+# Strategie- & Filterparameter
 MAX_TRADES_PER_DAY = 3
 MAX_LOSSES_PER_DAY = 2
 MIN_CONFIDENCE     = 65
 MIN_ADX            = 15.5
-MIN_SL_DOLLARS     = 10.0    # Schutz vor normalem Gold-Rauschen
+MIN_SL_DOLLARS     = 10.0
 MAX_SL_DOLLARS     = 30.0
 MIN_FVG_SIZE       = 1.20
 EQUAL_LEVEL_TOL    = 0.35
-ONLY_KILLZONES     = True    # True = 08:00-21:00 MEZ (ohne 14:30 News-Spike & Nacht-Rauschen)
+ONLY_KILLZONES     = True    # True = 08:00-21:00 MEZ (mit News-Puffer 14:20-14:40)
 RUNNER_TRAIL_GAP_R = 0.80    # Ab +3.0R 0.80R Abstand für längere Gold-Trends
 TZ                 = pytz.timezone("Europe/Berlin")
 
@@ -39,8 +39,12 @@ PAPER_MODE = True
 # Gold contract: 1.00 lot = 100oz -> $1 move = $100/lot -> $1 move = $1 per 0.01 lot
 USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0
 
+# Credit-Schutz: niemals über 800 Credits/Minute bzw. Safe-Budget hinausgehen
+MAX_CREDITS_PER_MINUTE = 800
+SAFE_CREDITS_PER_CYCLE = 3     # 1x 5min + 1x 15min + 1x 1h = 3 Credits pro 5-Minuten-Zyklus
+
 # ============================================
-# STATE
+# STATE (OHNE CACHE-DATEIEN)
 # ============================================
 current_equity        = float(CAPITAL)
 peak_equity           = float(CAPITAL)
@@ -50,7 +54,19 @@ losses_today          = 0
 last_trade_date       = None
 last_signal_direction = None
 last_signal_time      = 0
-active_trade          = None  # Überwacht den laufenden Trade für dynamisches SL-Trailing
+active_trade          = None
+
+# Rolling 60s Credit-Tracker (strikt <= 800)
+credit_timestamps = []
+
+def can_spend_credits(cost):
+    now_ts = time.time()
+    credit_timestamps[:] = [t for t in credit_timestamps if (now_ts - t) < 60.0]
+    used_last_min = sum(c for _, c in credit_timestamps)
+    if used_last_min + cost > MAX_CREDITS_PER_MINUTE:
+        return False, used_last_min
+    credit_timestamps.append((now_ts, cost))
+    return True, used_last_min + cost
 
 # ============================================
 # TELEGRAM
@@ -68,19 +84,42 @@ def send_telegram(message):
         print(f"Telegram error: {e}", flush=True)
 
 # ============================================
-# FETCH CANDLES
+# ONLINE CANDLE FETCH (OHNE CACHE, STRIKT <= 800 CREDITS)
 # ============================================
-def get_candles(interval="5min", outputsize=100):
+def get_candles(interval="5min", outputsize=100, credit_cost=1):
+    if not TWELVEDATA_API_KEY:
+        print("API Error: TWELVEDATA_API_KEY fehlt!", flush=True)
+        return None
+
+    while True:
+        allowed_spend, used_now = can_spend_credits(credit_cost)
+        if allowed_spend:
+            break
+        wait_sec = 5.0
+        if credit_timestamps:
+            oldest_ts = credit_timestamps[0][0]
+            wait_sec = max(1.0, min(60.0 - (time.time() - oldest_ts) + 0.5, 30.0))
+        print(
+            f"🛡️ Credit-Limit-Schutz ({used_now}/{MAX_CREDITS_PER_MINUTE}/min) – warte {wait_sec:.1f}s...",
+            flush=True,
+        )
+        time.sleep(wait_sec)
+
     url    = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
         "interval": interval,
         "outputsize": outputsize,
+        "timezone": "Europe/Berlin",
         "apikey": TWELVEDATA_API_KEY,
         "format": "JSON",
     }
     try:
         r    = requests.get(url, params=params, timeout=15)
+        if r.status_code == 429:
+            print("⏳ HTTP 429 Rate-Limit – warte 62s...", flush=True)
+            time.sleep(62)
+            return None
         data = r.json()
         if "values" not in data:
             print(f"API Error ({interval}): {data}", flush=True)
@@ -133,7 +172,6 @@ def calculate_atr(candles, period=14):
     return sum(tr_list[-period:]) / period
 
 def calculate_adx(candles, period=14):
-    """Misst die Trendstärke."""
     if len(candles) < period * 2:
         return 25.0
     plus_dm, minus_dm, tr_list = [], [], []
@@ -236,8 +274,7 @@ def analyze_structure_bos(candles, allow_strong_ema=False):
         atr_tf = calculate_atr(candles)
         if abs(ema_fast - ema_slow) >= atr_tf * 0.25:
             return ema_bias, None, False
-    else:
-        return "NEUTRAL", None, False
+    return "NEUTRAL", None, False
 
 # ============================================
 # ORDER BLOCK, LIQUIDITY & FVG (ON CLOSED CANDLES)
@@ -268,7 +305,6 @@ def detect_order_block(candles, bias):
     return None, None, False
 
 def detect_liquidity_zones(closed_candles):
-    """Prüft auf geschlossenen Kerzen, ob Stops abgefischt wurden und der Kurs wieder innen schloss."""
     if len(closed_candles) < 10:
         return False, False, False, False
 
@@ -314,10 +350,6 @@ def detect_fvg(closed_candles):
 # CONFIRMATION CANDLE (ANTI-FALLING-KNIFE)
 # ============================================
 def check_entry_confirmation(closed_candles, direction):
-    """
-    Verhindert Einstiege, während der Kurs noch ungebremst gegen uns läuft.
-    Verlangt eine geschlossene Umkehr-/Bestätigungskerze in Trade-Richtung.
-    """
     if len(closed_candles) < 2:
         return False, "None"
 
@@ -416,11 +448,6 @@ def calculate_lots(sl_dollars, risk_pct):
 # ACTIVE TRADE MONITOR (1:3+ UNLIMITED PROFIT TRAIL)
 # ============================================
 def monitor_active_trade(closed_5m):
-    """
-    Zieht den SL stufenweise nach, ohne den Gewinn bei 1:3 zu deckeln:
-    - Bis 2.5R: 1.0R Abstand (1.0R -> BE, 1.5R -> +0.5R, 2.0R -> +1.0R, 2.5R -> +1.5R)
-    - Ab 3.0R (1:3 erreicht): RUNNER_TRAIL_GAP_R (0.80R) Abstand
-    """
     global active_trade, current_equity, peak_equity, consecutive_losses, losses_today
     if not active_trade or not closed_5m:
         return
@@ -449,10 +476,8 @@ def monitor_active_trade(closed_5m):
             else:
                 status = "🛡️ <b>BREAK-EVEN HIT ($0)</b>"
             send_telegram(
-                f"{status}
-"
-                f"XAUUSD LONG @ {entry:.2f} geschlossen bei <b>{sl:.2f}</b>.
-"
+                f"{status}\n"
+                f"XAUUSD LONG @ {entry:.2f} geschlossen bei <b>{sl:.2f}</b>.\n"
                 f"Kontostand: <b>${current_equity:.2f}</b>"
             )
             active_trade = None
@@ -476,10 +501,8 @@ def monitor_active_trade(closed_5m):
             else:
                 status = "🛡️ <b>BREAK-EVEN HIT ($0)</b>"
             send_telegram(
-                f"{status}
-"
-                f"XAUUSD SHORT @ {entry:.2f} geschlossen bei <b>{sl:.2f}</b>.
-"
+                f"{status}\n"
+                f"XAUUSD SHORT @ {entry:.2f} geschlossen bei <b>{sl:.2f}</b>.\n"
                 f"Kontostand: <b>${current_equity:.2f}</b>"
             )
             active_trade = None
@@ -512,12 +535,9 @@ def monitor_active_trade(closed_5m):
             info   = f"Sicherer Gewinn: <b>~+${locked_usd:.2f}</b>"
 
         send_telegram(
-            f"{header}
-"
-            f"XAUUSD {d} hat <b>{milestone_r:.1f}R</b> erreicht.
-"
-            f"👉 Ziehe deinen SL in MT5 jetzt auf <b>{new_sl_price:.2f}</b>!
-"
+            f"{header}\n"
+            f"XAUUSD {d} hat <b>{milestone_r:.1f}R</b> erreicht.\n"
+            f"👉 Ziehe deinen SL in MT5 jetzt auf <b>{new_sl_price:.2f}</b>!\n"
             f"{info}"
         )
 
@@ -631,7 +651,7 @@ def generate_signal(candles_5m, candles_15m, candles_1h):
         print(f"Price: {curr_price:.2f} | Long: {long_score} | Short: {short_score} (<{MIN_CONFIDENCE})", flush=True)
         return None
 
-    # 5. Pflicht-Bestätigungskerze prüfen (kein Einstieg gegen laufende Kerze!)
+    # 5. Pflicht-Bestätigungskerze prüfen
     confirmed, candle_pattern = check_entry_confirmation(closed_5m, signal)
     if not confirmed:
         print(f"Signal {signal} zurückgehalten: Warte auf Bestätigungskerze ({candle_pattern}).", flush=True)
@@ -698,17 +718,11 @@ def send_signal(sig):
         "risk_amount": sig["potential_loss"],
     }
 
-    reasons_text = "
-".join([f"  ✅ {r}" for r in sig["reasons"]])
+    reasons_text = "\n".join([f"  ✅ {r}" for r in sig["reasons"]])
     now_str      = datetime.now(TZ).strftime("%d %b %Y %H:%M %Z")
     mode_banner  = (
-        "🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>
-<i>Review only.</i>
-
-"
-        if PAPER_MODE else "⚡ <b>LIVE SIGNAL</b>
-
-"
+        "🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>\n<i>Review only.</i>\n\n"
+        if PAPER_MODE else "⚡ <b>LIVE SIGNAL</b>\n\n"
     )
 
     msg = f"""{mode_banner}⚔️ <b>XAUUSD SIGNAL</b> {emoji}
@@ -754,28 +768,16 @@ def check_session_allowed(now):
 def main():
     global trades_today, losses_today, last_trade_date, last_signal_direction, last_signal_time
 
-    print("🚀 XAUUSD SMC Bot Starting...", flush=True)
+    print("🚀 XAUUSD SMC Bot (Online-Only, <=800 Credits) Starting...", flush=True)
     send_telegram(
-        f"🚀 <b>XAUUSD SMC Bot LIVE</b>
-
-"
-        f"{'🧪 PAPER MODE' if PAPER_MODE else '⚡ LIVE MODE'}
-
-"
-        f"Strategy: BOS + CHoCH + Order Blocks
-"
-        f"+ Liquidity Sweeps + FVG + ADX + Confirmation
-
-"
-        f"Capital: ${current_equity:.2f} | Risk: {BASE_RISK_PERCENT*100:.1f}% / Boost: {BOOST_RISK_PERCENT*100:.1f}%
-"
-        f"Session: 08:00 - 21:00 MEZ (Credit-Saver aktiv)
-"
-        f"Target: 1:3+ Runner (Unlimited Trailing SL)
-"
-        f"Min Confidence: {MIN_CONFIDENCE}% | Max/Day: {MAX_TRADES_PER_DAY}
-
-"
+        f"🚀 <b>XAUUSD SMC Bot LIVE</b>\n\n"
+        f"{'🧪 PAPER MODE' if PAPER_MODE else '⚡ LIVE MODE'}\n\n"
+        f"Strategy: BOS + CHoCH + Order Blocks\n"
+        f"+ Liquidity Sweeps + FVG + ADX + Confirmation\n\n"
+        f"Capital: ${current_equity:.2f} | Risk: {BASE_RISK_PERCENT*100:.1f}% / Boost: {BOOST_RISK_PERCENT*100:.1f}%\n"
+        f"Session: 08:00 - 21:00 MEZ (Online-Only, Max 800 Credits/min)\n"
+        f"Target: 1:3+ Runner (Unlimited Trailing SL)\n"
+        f"Min Confidence: {MIN_CONFIDENCE}% | Max/Day: {MAX_TRADES_PER_DAY}\n\n"
         f"Scanning every 5 minutes ⚔️"
     )
 
@@ -789,29 +791,28 @@ def main():
                 losses_today          = 0
                 last_trade_date       = today
                 last_signal_direction = None
-                send_telegram(f"📅 <b>New Day: {today}</b>
-Signals remaining: {MAX_TRADES_PER_DAY}")
+                send_telegram(f"📅 <b>New Day: {today}</b>\nSignals remaining: {MAX_TRADES_PER_DAY}")
 
             if now.weekday() >= 5:
                 time.sleep(3600)
                 continue
 
             allowed, session_label = check_session_allowed(now)
-            print(f"
-[{now.strftime('%H:%M')}] {session_label} | Signals: {trades_today}/{MAX_TRADES_PER_DAY} | Equity: ${current_equity:.2f}", flush=True)
+            print(f"\n[{now.strftime('%H:%M')}] {session_label} | Signals: {trades_today}/{MAX_TRADES_PER_DAY} | Equity: ${current_equity:.2f}", flush=True)
 
             if not active_trade and ONLY_KILLZONES and not allowed:
-                print("Nachtruhe / News-Schutz — pausiere API-Abfragen (spart Credits).", flush=True)
+                print("Nachtruhe / News-Schutz — pausiere API-Abfragen (0 Credits).", flush=True)
                 ts         = time.time()
                 sleep_time = (300 - (ts % 300)) + 3
                 time.sleep(sleep_time)
                 continue
 
-            candles_5m  = get_candles("5min", 100)
-            time.sleep(2)
-            candles_15m = get_candles("15min", 100)
-            time.sleep(2)
-            candles_1h  = get_candles("1h", 100)
+            # Online-Abruf strikt begrenzt (3 Credits pro 5-Minuten-Zyklus << 800 Credits/min)
+            candles_5m  = get_candles("5min", 100, credit_cost=1)
+            time.sleep(1.5)
+            candles_15m = get_candles("15min", 100, credit_cost=1)
+            time.sleep(1.5)
+            candles_1h  = get_candles("1h", 100, credit_cost=1)
 
             if not candles_5m or not candles_15m or not candles_1h:
                 print("Fetch failed. Retry in 2min...", flush=True)
