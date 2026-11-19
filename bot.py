@@ -8,9 +8,9 @@ from datetime import datetime, timedelta
 # ============================================
 # CONFIGURATION (XAUUSD SMC BOT - 10K+ SETTINGS)
 # ============================================
-TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
-TWELVEDATA_API_KEY   = os.getenv("TWELVEDATA_API_KEY", "81f11b0a3bda4cc6991d8e2f9d4f3da2")
+TELEGRAM_BOT_TOKEN   = "8881921114:AAEXluT-lVMUoQdSsUqIKRZdEEqQWVl7mUQ"
+TELEGRAM_CHAT_ID     = "801891845"
+TWELVEDATA_API_KEY   = "81f11b0a3bda4cc6991d8e2f9d4f3da2"
 
 SYMBOL               = "XAU/USD"
 INTERVAL             = "5min"
